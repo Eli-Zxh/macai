@@ -1,0 +1,25 @@
+# Compiled binaries
+ocr
+asr
+tts
+
+# MLX model (7.8GB)
+models/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Build artifacts
+*.o
+*.d
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
