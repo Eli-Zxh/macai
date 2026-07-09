@@ -228,7 +228,7 @@ func performASR(config: ASRConfig) -> String? {
 
     // 执行识别
     var isDone = false
-    var finalResult: SFSpeechRecognitionResult? = nil
+    var bestResult: SFSpeechRecognitionResult? = nil
     var resultError: Error? = nil
 
     fputs("正在识别: \(config.inputPath) ...\n", stderr)
@@ -240,8 +240,13 @@ func performASR(config: ASRConfig) -> String? {
             return
         }
         guard let result = result else { return }
+        // 保留最长的识别结果（防止 isFinal 提前触发导致结果不完整）
+        let newLen = result.bestTranscription.formattedString.count
+        let oldLen = bestResult?.bestTranscription.formattedString.count ?? 0
+        if result.isFinal || newLen > oldLen {
+            bestResult = result
+        }
         if result.isFinal {
-            finalResult = result
             isDone = true
         }
     }
@@ -256,66 +261,98 @@ func performASR(config: ASRConfig) -> String? {
         return nil
     }
 
-    guard let result = finalResult else {
+    guard let result = bestResult else {
         fputs("ERROR: 未获得识别结果\n", stderr)
         return nil
     }
 
+    let transcript = result.bestTranscription.formattedString
+    fputs("识别完成: \(transcript.count) 字符\n", stderr)
+
     // 提取结果
     switch config.outputFormat {
     case "srt":
-        return formatSRT(result: result)
+        return formatSRT(transcript: transcript, result: result)
     case "txt":
-        return result.bestTranscription.formattedString
+        return transcript
     default:
-        return result.bestTranscription.formattedString
+        return transcript
     }
 }
 
-func formatSRT(result: SFSpeechRecognitionResult) -> String {
+func formatSRT(transcript: String, result: SFSpeechRecognitionResult) -> String {
     let segments = result.bestTranscription.segments
-    var srtLines: [String] = []
-    var index = 1
 
-    // 将 segments 按合理间隔分组（以标点或停顿为界）
-    var currentText = ""
-    var currentStart: TimeInterval = 0
-    var currentEnd: TimeInterval = 0
+    // 计算音频总时长
+    let totalDuration: TimeInterval = {
+        guard let lastSeg = segments.last else { return 0 }
+        return lastSeg.timestamp + lastSeg.duration
+    }()
 
-    for segment in segments {
-        if currentText.isEmpty {
-            currentStart = segment.timestamp
-        }
+    // 按句子边界拆分文本（中英文标点）
+    let sentences = splitSentences(transcript)
+    guard !sentences.isEmpty else { return "" }
 
-        currentText += segment.substring
-        currentEnd = segment.timestamp + segment.duration
-
-        // 如果下一个 segment 间隔超过 0.5 秒，或者当前 segment 以标点结尾，则分割
-        let isLast = segment === segments.last!
-        let nextGap: TimeInterval = {
-            guard !isLast,
-                  let nextIdx = segments.firstIndex(where: { $0 === segment }).map({ $0 + 1 }),
-                  nextIdx < segments.count else { return 0 }
-            return segments[nextIdx].timestamp - currentEnd
-        }()
-
-        let shouldSplit = isLast || nextGap > 0.5 ||
-            currentText.hasSuffix("。") || currentText.hasSuffix(".") ||
-            currentText.hasSuffix("？") || currentText.hasSuffix("?") ||
-            currentText.hasSuffix("！") || currentText.hasSuffix("!") ||
-            currentText.hasSuffix("，") || currentText.hasSuffix(",")
-
-        if shouldSplit && !currentText.isEmpty {
-            srtLines.append("\(index)")
-            srtLines.append("\(formatSRTTime(currentStart)) --> \(formatSRTTime(currentEnd))")
-            srtLines.append(currentText.trimmingCharacters(in: .whitespaces))
+    // 如果 segments 为空或总时长为 0，用均匀分配
+    guard !segments.isEmpty, totalDuration > 0 else {
+        var srtLines: [String] = []
+        for (i, sentence) in sentences.enumerated() {
+            let start = Double(i) * 1.0
+            let end = start + 1.0
+            srtLines.append("\(i + 1)")
+            srtLines.append("\(formatSRTTime(start)) --> \(formatSRTTime(end))")
+            srtLines.append(sentence)
             srtLines.append("")
-            index += 1
-            currentText = ""
         }
+        return srtLines.joined(separator: "\n")
+    }
+
+    // 按字符数比例分配时间戳
+    let totalChars = sentences.reduce(0) { $0 + $1.count }
+    var srtLines: [String] = []
+    var currentTime: TimeInterval = 0
+
+    for (i, sentence) in sentences.enumerated() {
+        let proportion = Double(sentence.count) / Double(max(totalChars, 1))
+        let sentenceDuration = totalDuration * proportion
+        let endTime = currentTime + sentenceDuration
+
+        srtLines.append("\(i + 1)")
+        srtLines.append("\(formatSRTTime(currentTime)) --> \(formatSRTTime(endTime))")
+        srtLines.append(sentence)
+        srtLines.append("")
+
+        currentTime = endTime
     }
 
     return srtLines.joined(separator: "\n")
+}
+
+/// 按句子边界拆分文本（支持中英文标点）
+func splitSentences(_ text: String) -> [String] {
+    var sentences: [String] = []
+    var current = ""
+
+    let sentenceEndings: Set<Character> = [".", "。", "!", "！", "?", "？", ";", "；"]
+
+    for char in text {
+        current.append(char)
+        if sentenceEndings.contains(char) {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                sentences.append(trimmed)
+            }
+            current = ""
+        }
+    }
+
+    // 处理最后没有标点的部分
+    let remaining = current.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !remaining.isEmpty {
+        sentences.append(remaining)
+    }
+
+    return sentences
 }
 
 // MARK: - 主入口
