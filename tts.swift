@@ -362,14 +362,12 @@ func synthesize(config: TTSConfig) -> Bool {
         fputs("已写入: \(finalPath)\n", stderr)
         return true
     } else {
-        // 直接播放
+        // 直接播放（使用 RunLoop 轮询，DispatchSemaphore 在 CLI 工具中会死锁）
         fputs("正在朗读...\n", stderr)
         synthesizer.speak(utterance)
-        semaphore.wait()
 
-        if delegate.didCancel {
-            fputs("朗读已取消\n", stderr)
-            return false
+        while synthesizer.isSpeaking {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
         }
         return true
     }

@@ -227,7 +227,7 @@ func performASR(config: ASRConfig) -> String? {
     }
 
     // 执行识别
-    let resultSemaphore = DispatchSemaphore(value: 0)
+    var isDone = false
     var finalResult: SFSpeechRecognitionResult? = nil
     var resultError: Error? = nil
 
@@ -236,17 +236,20 @@ func performASR(config: ASRConfig) -> String? {
     recognizer.recognitionTask(with: request) { result, error in
         if let error = error {
             resultError = error
-            resultSemaphore.signal()
+            isDone = true
             return
         }
         guard let result = result else { return }
         if result.isFinal {
             finalResult = result
-            resultSemaphore.signal()
+            isDone = true
         }
     }
 
-    resultSemaphore.wait()
+    // 使用 RunLoop 轮询等待结果（CLI 工具无活跃 RunLoop，DispatchSemaphore 会死锁）
+    while !isDone {
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+    }
 
     if let error = resultError {
         fputs("ERROR: 识别失败: \(error.localizedDescription)\n", stderr)
