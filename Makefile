@@ -9,7 +9,7 @@ asr: asr.swift
 	swiftc -O -framework Speech -framework AVFoundation asr.swift -o asr
 
 tts: tts.swift
-	swiftc -O -framework AVFoundation -framework Cocoa tts.swift -o tts
+	swiftc -O -framework AVFoundation -framework Cocoa -framework NaturalLanguage tts.swift -o tts
 
 clean:
 	rm -f ocr asr tts

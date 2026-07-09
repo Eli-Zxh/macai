@@ -178,19 +178,12 @@ func performASR(config: ASRConfig) -> String? {
         return nil
     }
 
-    // 请求授权
-    let authSemaphore = DispatchSemaphore(value: 0)
-    var authStatus: SFSpeechRecognizerAuthorizationStatus = .notDetermined
+    // 检查授权状态（不调用 requestAuthorization，CLI 工具中会崩溃）
+    let authStatus = SFSpeechRecognizer.authorizationStatus()
 
-    SFSpeechRecognizer.requestAuthorization { status in
-        authStatus = status
-        authSemaphore.signal()
-    }
-    authSemaphore.wait()
-
-    guard authStatus == .authorized else {
-        fputs("ERROR: 语音识别未授权。请在 系统偏好设置 → 隐私与安全 → 语音识别 中授权\n", stderr)
-        return nil
+    if authStatus != .authorized {
+        fputs("WARNING: 语音识别可能未授权。如果识别结果不完整，请从 Terminal.app 运行本工具\n", stderr)
+        fputs("  系统设置 → 隐私与安全 → 语音识别 → 允许 Terminal\n", stderr)
     }
 
     // 创建识别器
@@ -211,11 +204,12 @@ func performASR(config: ASRConfig) -> String? {
 
     // 创建识别请求
     let request = SFSpeechURLRecognitionRequest(url: fileURL)
-    request.shouldReportPartialResults = false
+    request.shouldReportPartialResults = true
     request.taskHint = config.taskHint
 
     if #available(macOS 12.0, *) {
-        request.addsPunctuation = config.addsPunctuation
+        // SRT 模式下自动启用标点（用于分句），或用户手动启用
+        request.addsPunctuation = config.addsPunctuation || config.outputFormat == "srt"
     } else if config.addsPunctuation {
         fputs("WARNING: --punctuation 需要 macOS 12+，已忽略\n", stderr)
     }
@@ -228,7 +222,7 @@ func performASR(config: ASRConfig) -> String? {
 
     // 执行识别
     var isDone = false
-    var bestResult: SFSpeechRecognitionResult? = nil
+    var allResults: [SFSpeechRecognitionResult] = []
     var resultError: Error? = nil
 
     fputs("正在识别: \(config.inputPath) ...\n", stderr)
@@ -240,12 +234,7 @@ func performASR(config: ASRConfig) -> String? {
             return
         }
         guard let result = result else { return }
-        // 保留最长的识别结果（防止 isFinal 提前触发导致结果不完整）
-        let newLen = result.bestTranscription.formattedString.count
-        let oldLen = bestResult?.bestTranscription.formattedString.count ?? 0
-        if result.isFinal || newLen > oldLen {
-            bestResult = result
-        }
+        allResults.append(result)
         if result.isFinal {
             isDone = true
         }
@@ -261,18 +250,20 @@ func performASR(config: ASRConfig) -> String? {
         return nil
     }
 
-    guard let result = bestResult else {
+    guard !allResults.isEmpty else {
         fputs("ERROR: 未获得识别结果\n", stderr)
         return nil
     }
 
-    let transcript = result.bestTranscription.formattedString
+    // 从所有结果中选择最长的（partial results 可能逐步增长）
+    let bestResult = allResults.max(by: { $0.bestTranscription.formattedString.count < $1.bestTranscription.formattedString.count })!
+    let transcript = bestResult.bestTranscription.formattedString
     fputs("识别完成: \(transcript.count) 字符\n", stderr)
 
     // 提取结果
     switch config.outputFormat {
     case "srt":
-        return formatSRT(transcript: transcript, result: result)
+        return formatSRT(transcript: transcript, result: bestResult, audioFilePath: config.inputPath)
     case "txt":
         return transcript
     default:
@@ -280,21 +271,39 @@ func performASR(config: ASRConfig) -> String? {
     }
 }
 
-func formatSRT(transcript: String, result: SFSpeechRecognitionResult) -> String {
+func formatSRT(transcript: String, result: SFSpeechRecognitionResult, audioFilePath: String) -> String {
     let segments = result.bestTranscription.segments
 
-    // 计算音频总时长
-    let totalDuration: TimeInterval = {
+    // 从音频文件读取实际时长
+    let audioDuration: TimeInterval = {
+        guard let audioFile = try? AVAudioFile(forReading: URL(fileURLWithPath: audioFilePath)) else { return 0 }
+        return Double(audioFile.length) / audioFile.processingFormat.sampleRate
+    }()
+
+    // 也尝试从 segments 获取时长
+    let segmentDuration: TimeInterval = {
         guard let lastSeg = segments.last else { return 0 }
         return lastSeg.timestamp + lastSeg.duration
     }()
 
+    // 优先使用 segment 时长（更精确），否则使用音频文件时长
+    let totalDuration = segmentDuration > 0 ? segmentDuration : audioDuration
+
     // 按句子边界拆分文本（中英文标点）
-    let sentences = splitSentences(transcript)
+    var sentences = splitSentences(transcript)
+
+    // 如果标点拆分只有 1 句，尝试用 segments 时间间隔拆分
+    if sentences.count <= 1 && segments.count > 1 {
+        let gapSplit = splitBySegmentGaps(transcript: transcript, segments: segments)
+        if gapSplit.count > 1 {
+            sentences = gapSplit
+        }
+    }
+
     guard !sentences.isEmpty else { return "" }
 
-    // 如果 segments 为空或总时长为 0，用均匀分配
-    guard !segments.isEmpty, totalDuration > 0 else {
+    // 如果总时长为 0，用均匀分配（每句 1 秒）
+    guard totalDuration > 0 else {
         var srtLines: [String] = []
         for (i, sentence) in sentences.enumerated() {
             let start = Double(i) * 1.0
@@ -333,7 +342,7 @@ func splitSentences(_ text: String) -> [String] {
     var sentences: [String] = []
     var current = ""
 
-    let sentenceEndings: Set<Character> = [".", "。", "!", "！", "?", "？", ";", "；"]
+    let sentenceEndings: Set<Character> = [".", "。", "!", "！", "?", "？", ";", "；", ",", "，"]
 
     for char in text {
         current.append(char)
@@ -353,6 +362,57 @@ func splitSentences(_ text: String) -> [String] {
     }
 
     return sentences
+}
+
+/// 利用 word-level segments 的时间间隔拆分句子（间隔 > 0.3s 视为句间停顿）
+func splitBySegmentGaps(transcript: String, segments: [SFTranscriptionSegment]) -> [String] {
+    guard segments.count > 1 else { return [transcript] }
+
+    // 建立每个 word 在 transcript 中的位置映射
+    let words = transcript.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+    guard words.count > 1 else { return [transcript] }
+
+    // 找到 segments 中的大间隔（> 0.3s）
+    var splitIndices: [Int] = []
+    for i in 1..<segments.count {
+        let gap = segments[i].timestamp - (segments[i-1].timestamp + segments[i-1].duration)
+        if gap > 0.3 {
+            splitIndices.append(i)
+        }
+    }
+
+    guard !splitIndices.isEmpty else { return [transcript] }
+
+    // 将 segment 索引映射到 word 索引，然后映射到字符位置
+    // segments 通常对应 words（一个 segment 对应一个 word）
+    var sentences: [String] = []
+    var lastWordEnd = 0
+
+    for segIdx in splitIndices {
+        // segment 索引近似对应 word 索引
+        let wordIdx = min(segIdx, words.count)
+        // 计算这个 word 之前的字符位置
+        let charPos = words.prefix(wordIdx).joined(separator: " ").count
+        if charPos > lastWordEnd {
+            let sentence = String(transcript[transcript.startIndex..<transcript.index(transcript.startIndex, offsetBy: charPos)])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !sentence.isEmpty {
+                sentences.append(sentence)
+            }
+            lastWordEnd = charPos
+        }
+    }
+
+    // 添加剩余部分
+    if lastWordEnd < transcript.count {
+        let remaining = String(transcript[transcript.index(transcript.startIndex, offsetBy: lastWordEnd)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !remaining.isEmpty {
+            sentences.append(remaining)
+        }
+    }
+
+    return sentences.isEmpty ? [transcript] : sentences
 }
 
 // MARK: - 主入口

@@ -5,6 +5,7 @@
 import Foundation
 import AVFoundation
 import Cocoa
+import NaturalLanguage
 
 // MARK: - 参数解析
 
@@ -229,6 +230,50 @@ func listAllVoices(filter: String? = nil) {
     print("\n共 \(filtered.count) 个音色")
 }
 
+// MARK: - 语言检测与自动音色选择
+
+func detectLanguage(text: String) -> String? {
+    let recognizer = NLLanguageRecognizer()
+    recognizer.processString(text)
+    guard let language = recognizer.dominantLanguage else { return nil }
+
+    // NLLanguage 返回 BCP-47 代码，映射到语音音色语言代码
+    let code = language.rawValue
+    if code.hasPrefix("zh") {
+        return "zh-CN"
+    } else if code.hasPrefix("en") {
+        return "en-US"
+    } else if code.hasPrefix("ja") {
+        return "ja-JP"
+    } else if code.hasPrefix("ko") {
+        return "ko-KR"
+    } else {
+        return code
+    }
+}
+
+func autoSelectVoice(for text: String) -> AVSpeechSynthesisVoice? {
+    guard let langCode = detectLanguage(text: text) else { return nil }
+
+    // 优先选择 compact/premium 质量的音色
+    let voices = AVSpeechSynthesisVoice.speechVoices()
+    let langVoices = voices.filter { $0.language.hasPrefix(langCode) }
+
+    // 优先选择非 eloquence 的音色（Eddy/Flo 等是特殊音色）
+    if let voice = langVoices.first(where: {
+        !$0.identifier.contains("eloquence") && !$0.identifier.contains("speech.synthesis")
+    }) {
+        return voice
+    }
+
+    // 回退到语言前缀匹配
+    if let voice = AVSpeechSynthesisVoice(language: langCode) {
+        return voice
+    }
+
+    return nil
+}
+
 func findVoice(name: String?) -> AVSpeechSynthesisVoice? {
     guard let name = name else { return nil }
 
@@ -301,8 +346,16 @@ func synthesize(config: TTSConfig) -> Bool {
         return false
     }
 
-    // 查找音色
-    let voice = findVoice(name: config.voiceName)
+    // 查找音色（未指定时自动检测文本语言）
+    let voice: AVSpeechSynthesisVoice?
+    if let name = config.voiceName, !name.isEmpty {
+        voice = findVoice(name: name)
+    } else {
+        voice = autoSelectVoice(for: text)
+        if let v = voice {
+            fputs("INFO: 自动检测到语言 \(v.language)，使用音色 \(v.name)\n", stderr)
+        }
+    }
 
     // 创建合成器
     let synthesizer = AVSpeechSynthesizer()
@@ -323,7 +376,7 @@ func synthesize(config: TTSConfig) -> Bool {
 
     // 输出到文件或播放
     if let outputPath = config.outputPath {
-        // 使用 NSSpeechSynthesizer 写入文件（所有 macOS 版本均支持）
+        // 使用 NSSpeechSynthesizer 写入文件
         let voiceName: NSSpeechSynthesizer.VoiceName? = voice.map { NSSpeechSynthesizer.VoiceName(rawValue: $0.identifier) }
         guard let nsSpeech = NSSpeechSynthesizer(voice: voiceName) else {
             fputs("ERROR: 无法创建 NSSpeechSynthesizer\n", stderr)
@@ -340,11 +393,10 @@ func synthesize(config: TTSConfig) -> Bool {
         if ext == "aiff" || ext == "aif" {
             finalPath = outputPath
         } else {
-            // 非 AIFF 格式先输出 AIFF 再提示用户
             finalPath = (outputPath as NSString).deletingPathExtension + ".aiff"
             if ext != "aiff" && ext != "aif" {
                 fputs("NOTE: NSSpeechSynthesizer 输出 AIFF 格式，文件保存为: \(finalPath)\n", stderr)
-                fputs("      如需 WAV/CAF 格式，可用系统 say 命令或 ffmpeg 转换\n", stderr)
+                fputs("      如需 WAV 格式，可用 ffmpeg -i \(finalPath) \(outputPath) 转换\n", stderr)
             }
         }
 
@@ -355,10 +407,17 @@ func synthesize(config: TTSConfig) -> Bool {
             return false
         }
 
-        // 等待完成
+        // 等待合成开始（isSpeaking 不会立即变为 true）
+        let waitStart = Date()
+        while !nsSpeech.isSpeaking && Date().timeIntervalSince(waitStart) < 5.0 {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        }
+
+        // 等待合成结束
         while nsSpeech.isSpeaking {
             RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
         }
+
         fputs("已写入: \(finalPath)\n", stderr)
         return true
     } else {
