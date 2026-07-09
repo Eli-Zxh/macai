@@ -366,6 +366,13 @@ func synthesize(config: TTSConfig) -> Bool {
         fputs("正在朗读...\n", stderr)
         synthesizer.speak(utterance)
 
+        // 等待朗读开始（音频系统初始化需要时间，isSpeaking 不会立即变为 true）
+        let startTime = Date()
+        while !synthesizer.isSpeaking && Date().timeIntervalSince(startTime) < 5.0 {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        }
+
+        // 等待朗读结束
         while synthesizer.isSpeaking {
             RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
         }
