@@ -2,6 +2,7 @@
 ocr
 asr
 tts
+cv
 
 # MLX model (7.8GB)
 models/
