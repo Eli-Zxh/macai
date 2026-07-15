@@ -18,6 +18,7 @@ struct ASRConfig {
     var outputPath: String? = nil
     var showHelp: Bool = false
     var contextualStrings: [String] = []
+    var chunkDuration: TimeInterval = 30  // 每段识别时长（秒）
 }
 
 func printHelp() {
@@ -45,6 +46,8 @@ func printHelp() {
                                     txt — 纯文本
                                     srt — 带时间戳的 SRT 字幕格式
       -o, --output <路径>         输出到文件（默认输出到 stdout）
+      --chunk-duration <秒>       长音频分段识别间隔（默认: 30）
+                                  将长音频切分为指定时长的段逐段识别，避免超长音频识别失败
       -h, --help                  显示此帮助信息
 
     示例:
@@ -52,6 +55,7 @@ func printHelp() {
       asr meeting.m4a -l en-US --punctuation -f srt -o meeting.srt
       asr voice.wav --on-device -l zh-CN
       asr audio.wav --task-hint search --contextual "QoderWork,macOS"
+      asr long_meeting.wav --chunk-duration 60 -f srt -o meeting.srt
 
     注意:
       - 首次运行需要授权语音识别权限（系统偏好设置 → 隐私与安全 → 语音识别）
@@ -127,6 +131,17 @@ func parseArgs() -> ASRConfig? {
                 return nil
             }
             config.outputPath = args[i]
+        case "--chunk-duration":
+            i += 1
+            guard i < args.count else {
+                fputs("ERROR: --chunk-duration 需要参数（秒数）\n", stderr)
+                return nil
+            }
+            guard let val = Double(args[i]), val > 0 else {
+                fputs("ERROR: --chunk-duration 需要正数参数\n", stderr)
+                return nil
+            }
+            config.chunkDuration = val
         default:
             if arg.hasPrefix("-") {
                 fputs("ERROR: 未知选项 '\(arg)'\n", stderr)
@@ -169,6 +184,137 @@ struct Segment {
     let confidence: Float
 }
 
+/// 将音频文件切分为临时文件块，返回临时文件路径数组和每块的起始时间
+func splitAudioIntoChunks(fileURL: URL, chunkDuration: TimeInterval) -> ([(path: String, startTime: TimeInterval)], TimeInterval)? {
+    guard let audioFile = try? AVAudioFile(forReading: fileURL) else {
+        fputs("ERROR: 无法读取音频文件\n", stderr)
+        return nil
+    }
+
+    let sampleRate = audioFile.processingFormat.sampleRate
+    let totalFrames = AVAudioFrameCount(audioFile.length)
+    let framesPerChunk = AVAudioFrameCount(chunkDuration * sampleRate)
+
+    // 如果音频时长小于 chunk 时长，不需要切分
+    if totalFrames <= framesPerChunk {
+        return nil
+    }
+
+    let totalDuration = Double(totalFrames) / sampleRate
+    let chunkCount = Int(ceil(Double(totalFrames) / Double(framesPerChunk)))
+    let tempDir = NSTemporaryDirectory() + "asr_chunks_\(ProcessInfo.processInfo.processIdentifier)"
+
+    do {
+        try FileManager.default.createDirectory(atPath: tempDir, withIntermediateDirectories: true)
+    } catch {
+        fputs("ERROR: 无法创建临时目录\n", stderr)
+        return nil
+    }
+
+    var chunks: [(path: String, startTime: TimeInterval)] = []
+
+    for i in 0..<chunkCount {
+        let startFrame = AVAudioFramePosition(Double(i) * Double(framesPerChunk))
+        let remainingFrames = totalFrames - AVAudioFrameCount(startFrame)
+        let framesToRead = min(framesPerChunk, remainingFrames)
+
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: framesToRead) else {
+            fputs("ERROR: 无法创建音频缓冲区\n", stderr)
+            cleanupChunks(tempDir: tempDir)
+            return nil
+        }
+
+        do {
+            audioFile.framePosition = startFrame
+            try audioFile.read(into: buffer, frameCount: framesToRead)
+        } catch {
+            fputs("ERROR: 读取音频第 \(i + 1) 段失败: \(error.localizedDescription)\n", stderr)
+            cleanupChunks(tempDir: tempDir)
+            return nil
+        }
+
+        let chunkPath = "\(tempDir)/chunk_\(String(format: "%04d", i)).wav"
+        let chunkURL = URL(fileURLWithPath: chunkPath)
+
+        // 写入 WAV 格式
+        let outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                         sampleRate: sampleRate,
+                                         channels: audioFile.processingFormat.channelCount,
+                                         interleaved: false)!
+        guard let output = try? AVAudioFile(forWriting: chunkURL, settings: outputFormat.settings) else {
+            fputs("ERROR: 无法创建临时音频文件\n", stderr)
+            cleanupChunks(tempDir: tempDir)
+            return nil
+        }
+
+        do {
+            try output.write(from: buffer)
+        } catch {
+            fputs("ERROR: 写入临时音频失败: \(error.localizedDescription)\n", stderr)
+            cleanupChunks(tempDir: tempDir)
+            return nil
+        }
+
+        let startTime = Double(startFrame) / sampleRate
+        chunks.append((path: chunkPath, startTime: startTime))
+    }
+
+    fputs("音频总时长 \(String(format: "%.1f", totalDuration))s，切分为 \(chunkCount) 段（每段 \(Int(chunkDuration))s）\n", stderr)
+    return (chunks, totalDuration)
+}
+
+func cleanupChunks(tempDir: String) {
+    try? FileManager.default.removeItem(atPath: tempDir)
+}
+
+/// 对单个音频文件执行识别
+func recognizeSingleChunk(fileURL: URL, config: ASRConfig, recognizer: SFSpeechRecognizer) -> (transcript: String, result: SFSpeechRecognitionResult)? {
+    let request = SFSpeechURLRecognitionRequest(url: fileURL)
+    request.shouldReportPartialResults = true
+    request.taskHint = config.taskHint
+
+    if #available(macOS 12.0, *) {
+        request.addsPunctuation = config.addsPunctuation || config.outputFormat == "srt"
+    }
+
+    request.requiresOnDeviceRecognition = config.onDevice
+
+    if !config.contextualStrings.isEmpty {
+        request.contextualStrings = config.contextualStrings
+    }
+
+    var isDone = false
+    var allResults: [SFSpeechRecognitionResult] = []
+    var resultError: Error? = nil
+
+    recognizer.recognitionTask(with: request) { result, error in
+        if let error = error {
+            resultError = error
+            isDone = true
+            return
+        }
+        guard let result = result else { return }
+        allResults.append(result)
+        if result.isFinal {
+            isDone = true
+        }
+    }
+
+    while !isDone {
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+    }
+
+    if let error = resultError {
+        fputs("WARNING: 段识别出错: \(error.localizedDescription)\n", stderr)
+        return nil
+    }
+
+    guard !allResults.isEmpty else { return nil }
+
+    let bestResult = allResults.max(by: { $0.bestTranscription.formattedString.count < $1.bestTranscription.formattedString.count })!
+    return (bestResult.bestTranscription.formattedString, bestResult)
+}
+
 func performASR(config: ASRConfig) -> String? {
     let fileURL = URL(fileURLWithPath: config.inputPath)
 
@@ -202,68 +348,37 @@ func performASR(config: ASRConfig) -> String? {
         }
     }
 
-    // 创建识别请求
-    let request = SFSpeechURLRecognitionRequest(url: fileURL)
-    request.shouldReportPartialResults = true
-    request.taskHint = config.taskHint
+    // 获取音频总时长
+    let audioDuration: TimeInterval = {
+        guard let audioFile = try? AVAudioFile(forReading: fileURL) else { return 0 }
+        return Double(audioFile.length) / audioFile.processingFormat.sampleRate
+    }()
 
-    if #available(macOS 12.0, *) {
-        // SRT 模式下自动启用标点（用于分句），或用户手动启用
-        request.addsPunctuation = config.addsPunctuation || config.outputFormat == "srt"
-    } else if config.addsPunctuation {
-        fputs("WARNING: --punctuation 需要 macOS 12+，已忽略\n", stderr)
+    // 判断是否需要分段
+    let needsChunking = audioDuration > config.chunkDuration && config.chunkDuration > 0
+
+    if needsChunking {
+        return performChunkedASR(config: config, recognizer: recognizer, fileURL: fileURL, audioDuration: audioDuration)
+    } else {
+        return performSingleASR(config: config, recognizer: recognizer, fileURL: fileURL, audioDuration: audioDuration)
     }
+}
 
-    request.requiresOnDeviceRecognition = config.onDevice
-
-    if !config.contextualStrings.isEmpty {
-        request.contextualStrings = config.contextualStrings
-    }
-
-    // 执行识别
-    var isDone = false
-    var allResults: [SFSpeechRecognitionResult] = []
-    var resultError: Error? = nil
-
+/// 单段识别（短音频，原始逻辑）
+func performSingleASR(config: ASRConfig, recognizer: SFSpeechRecognizer, fileURL: URL, audioDuration: TimeInterval) -> String? {
     fputs("正在识别: \(config.inputPath) ...\n", stderr)
 
-    recognizer.recognitionTask(with: request) { result, error in
-        if let error = error {
-            resultError = error
-            isDone = true
-            return
-        }
-        guard let result = result else { return }
-        allResults.append(result)
-        if result.isFinal {
-            isDone = true
-        }
-    }
-
-    // 使用 RunLoop 轮询等待结果（CLI 工具无活跃 RunLoop，DispatchSemaphore 会死锁）
-    while !isDone {
-        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
-    }
-
-    if let error = resultError {
-        fputs("ERROR: 识别失败: \(error.localizedDescription)\n", stderr)
-        return nil
-    }
-
-    guard !allResults.isEmpty else {
+    guard let chunkResult = recognizeSingleChunk(fileURL: fileURL, config: config, recognizer: recognizer) else {
         fputs("ERROR: 未获得识别结果\n", stderr)
         return nil
     }
 
-    // 从所有结果中选择最长的（partial results 可能逐步增长）
-    let bestResult = allResults.max(by: { $0.bestTranscription.formattedString.count < $1.bestTranscription.formattedString.count })!
-    let transcript = bestResult.bestTranscription.formattedString
+    let transcript = chunkResult.transcript
     fputs("识别完成: \(transcript.count) 字符\n", stderr)
 
-    // 提取结果
     switch config.outputFormat {
     case "srt":
-        return formatSRT(transcript: transcript, result: bestResult, audioFilePath: config.inputPath)
+        return formatSRT(transcript: transcript, result: chunkResult.result, audioDuration: audioDuration)
     case "txt":
         return transcript
     default:
@@ -271,14 +386,114 @@ func performASR(config: ASRConfig) -> String? {
     }
 }
 
-func formatSRT(transcript: String, result: SFSpeechRecognitionResult, audioFilePath: String) -> String {
-    let segments = result.bestTranscription.segments
+/// 分段识别（长音频）
+func performChunkedASR(config: ASRConfig, recognizer: SFSpeechRecognizer, fileURL: URL, audioDuration: TimeInterval) -> String? {
+    guard let (chunks, _) = splitAudioIntoChunks(fileURL: fileURL, chunkDuration: config.chunkDuration) else {
+        // 切分失败，回退到单段识别
+        fputs("WARNING: 音频切分失败，尝试整体识别\n", stderr)
+        return performSingleASR(config: config, recognizer: recognizer, fileURL: fileURL, audioDuration: audioDuration)
+    }
 
-    // 从音频文件读取实际时长
-    let audioDuration: TimeInterval = {
-        guard let audioFile = try? AVAudioFile(forReading: URL(fileURLWithPath: audioFilePath)) else { return 0 }
-        return Double(audioFile.length) / audioFile.processingFormat.sampleRate
-    }()
+    defer { cleanupChunks(tempDir: NSTemporaryDirectory() + "asr_chunks_\(ProcessInfo.processInfo.processIdentifier)") }
+
+    // 逐段识别
+    var chunkResults: [(transcript: String, result: SFSpeechRecognitionResult, startTime: TimeInterval)] = []
+    let startTime = Date()
+
+    for (i, chunk) in chunks.enumerated() {
+        fputs("[\(i + 1)/\(chunks.count)] 识别 \(String(format: "%.1f", chunk.startTime))s-\(String(format: "%.1f", min(chunk.startTime + config.chunkDuration, audioDuration)))s ...", stderr)
+
+        let chunkURL = URL(fileURLWithPath: chunk.path)
+        if let result = recognizeSingleChunk(fileURL: chunkURL, config: config, recognizer: recognizer) {
+            chunkResults.append((transcript: result.transcript, result: result.result, startTime: chunk.startTime))
+            fputs(" ✓ \(result.transcript.count) 字符\n", stderr)
+        } else {
+            fputs(" ✗ 无结果\n", stderr)
+        }
+    }
+
+    guard !chunkResults.isEmpty else {
+        fputs("ERROR: 所有段均未获得识别结果\n", stderr)
+        return nil
+    }
+
+    let elapsed = Date().timeIntervalSince(startTime)
+    let totalChars = chunkResults.reduce(0) { $0 + $1.transcript.count }
+    fputs("分段识别完成: \(chunkResults.count) 段, \(totalChars) 字符, 耗时 \(String(format: "%.1f", elapsed))s\n", stderr)
+
+    // 合并结果
+    switch config.outputFormat {
+    case "srt":
+        return mergeSRTResults(chunkResults: chunkResults, audioDuration: audioDuration)
+    case "txt":
+        return chunkResults.map { $0.transcript }.joined(separator: "")
+    default:
+        return chunkResults.map { $0.transcript }.joined(separator: "")
+    }
+}
+
+/// 合并分段 SRT 结果
+func mergeSRTResults(chunkResults: [(transcript: String, result: SFSpeechRecognitionResult, startTime: TimeInterval)], audioDuration: TimeInterval) -> String {
+    var allSentences: [(text: String, globalStart: TimeInterval, globalEnd: TimeInterval)] = []
+
+    for (chunkIdx, chunk) in chunkResults.enumerated() {
+        let segments = chunk.result.bestTranscription.segments
+        let chunkTranscript = chunk.transcript
+
+        // 按句子边界拆分
+        var sentences = splitSentences(chunkTranscript)
+        if sentences.count <= 1 && segments.count > 1 {
+            let gapSplit = splitBySegmentGaps(transcript: chunkTranscript, segments: segments)
+            if gapSplit.count > 1 {
+                sentences = gapSplit
+            }
+        }
+
+        guard !sentences.isEmpty else { continue }
+
+        // 计算本段时长：优先用 segments，否则用下一段起始时间差或音频总时长
+        let chunkDuration: TimeInterval = {
+            if let lastSeg = segments.last {
+                let segEnd = lastSeg.timestamp + lastSeg.duration
+                if segEnd > 0 { return segEnd }
+            }
+            // 用下一段的起始时间减去本段起始时间
+            if chunkIdx + 1 < chunkResults.count {
+                return chunkResults[chunkIdx + 1].startTime - chunk.startTime
+            }
+            // 最后一段：用音频总时长减去本段起始时间
+            return audioDuration - chunk.startTime
+        }()
+
+        // 用字符比例分配本段时长
+        let totalChars = sentences.reduce(0) { $0 + $1.count }
+        var currentTime: TimeInterval = 0
+        for sentence in sentences {
+            let proportion = totalChars > 0 ? Double(sentence.count) / Double(totalChars) : 1.0 / Double(sentences.count)
+            let sentenceDuration = max(chunkDuration, 0.5) * proportion
+            let globalStart = chunk.startTime + currentTime
+            let globalEnd = chunk.startTime + currentTime + sentenceDuration
+            allSentences.append((text: sentence, globalStart: globalStart, globalEnd: globalEnd))
+            currentTime += sentenceDuration
+        }
+    }
+
+    guard !allSentences.isEmpty else { return "" }
+
+    // 生成 SRT
+    var srtLines: [String] = []
+    for (i, sentence) in allSentences.enumerated() {
+        srtLines.append("\(i + 1)")
+        srtLines.append("\(formatSRTTime(sentence.globalStart)) --> \(formatSRTTime(sentence.globalEnd))")
+        srtLines.append(sentence.text)
+        srtLines.append("")
+    }
+
+    return srtLines.joined(separator: "\n")
+}
+
+func formatSRT(transcript: String, result: SFSpeechRecognitionResult, audioDuration: TimeInterval) -> String {
+    let segments = result.bestTranscription.segments
 
     // 也尝试从 segments 获取时长
     let segmentDuration: TimeInterval = {
